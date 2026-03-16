@@ -1,0 +1,465 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Real-Time Collaboration Editor</title>
+    <link rel="stylesheet" href="/static/styles.css">
+    <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+</head>
+<body>
+    <div class="container">
+        <!-- Header -->
+        <header class="header">
+            <div class="header-left">
+                <h1 class="app-title">Collaboration Editor</h1>
+                <div class="document-info">
+                    <input type="text" id="docTitle" class="doc-title-input" placeholder="Untitled Document" maxlength="100">
+                    <span class="version-badge" id="versionBadge">v0</span>
+                </div>
+            </div>
+            <div class="header-right">
+                <div class="user-info">
+                    <span id="username" class="username"></span>
+                    <span class="user-status" id="userStatus">●</span>
+                </div>
+                <button id="newDocBtn" class="btn btn-primary">+ New Document</button>
+            </div>
+        </header>
+
+        <div class="editor-wrapper">
+            <!-- Sidebar with active users -->
+            <aside class="sidebar">
+                <div class="sidebar-section">
+                    <h3>Active Users</h3>
+                    <div id="usersList" class="users-list">
+                        <p class="placeholder">Connecting...</p>
+                    </div>
+                </div>
+                
+                <div class="sidebar-section">
+                    <h3>Remote Cursors</h3>
+                    <div id="cursorsList" class="cursors-list">
+                        <p class="placeholder">No other users editing</p>
+                    </div>
+                </div>
+
+                <div class="sidebar-section">
+                    <h3>Statistics</h3>
+                    <div class="stats">
+                        <div class="stat-item">
+                            <span class="stat-label">Characters:</span>
+                            <span class="stat-value" id="charCount">0</span>
+                        </div>
+                        <div class="stat-item">
+                            <span class="stat-label">Words:</span>
+                            <span class="stat-value" id="wordCount">0</span>
+                        </div>
+                        <div class="stat-item">
+                            <span class="stat-label">Lines:</span>
+                            <span class="stat-value" id="lineCount">1</span>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="sidebar-section">
+                    <h3>Share Document</h3>
+                    <div class="share-section">
+                        <input type="text" id="shareLink" class="share-link" readonly>
+                        <button id="copyBtn" class="btn btn-secondary">Copy Link</button>
+                    </div>
+                </div>
+            </aside>
+
+            <!-- Main editor -->
+            <main class="editor-main">
+                <div class="editor-container">
+                    <textarea 
+                        id="editor" 
+                        class="editor-textarea"
+                        placeholder="Start typing to collaborate... Multiple users can edit simultaneously with real-time synchronization."
+                        spellcheck="false"
+                    ></textarea>
+                    <div class="editor-overlay" id="editorOverlay"></div>
+                </div>
+
+                <!-- Live indicators -->
+                <div class="editor-footer">
+                    <div class="sync-status">
+                        <span class="sync-indicator" id="syncIndicator">●</span>
+                        <span id="syncStatus">Synced</span>
+                    </div>
+                    <div class="last-update">
+                        Last update: <span id="lastUpdate">just now</span>
+                    </div>
+                </div>
+            </main>
+        </div>
+    </div>
+
+    <!-- Remote cursor indicators -->
+    <div id="remotesCursorsContainer" class="remote-cursors-container"></div>
+
+    <!-- Notifications -->
+    <div id="notificationContainer" class="notification-container"></div>
+
+    <script>
+        // ================================================================
+        // CLIENT-SIDE COLLABORATION ENGINE
+        // ================================================================
+
+        class CollaborationClient {
+            constructor() {
+                this.socket = null;
+                this.sessionId = null;
+                this.userId = null;
+                this.username = null;
+                this.documentId = null;
+                this.currentVersion = 0;
+                this.localVersion = 0;
+                this.isConnected = false;
+                this.pendingOperations = [];
+                this.remoteCursors = new Map();
+                this.lastUpdateTime = new Date();
+                this.editor = document.getElementById('editor');
+                this.syncIndicator = document.getElementById('syncIndicator');
+                this.syncStatus = document.getElementById('syncStatus');
+                
+                this.initializeSocket();
+                this.setupEventListeners();
+                this.checkForDocumentId();
+            }
+
+            initializeSocket() {
+                const username = `User_${Math.random().toString(36).substr(2, 9)}`;
+                this.username = username;
+                document.getElementById('username').textContent = username;
+
+                this.socket = io({
+                    query: { username: username }
+                });
+
+                this.socket.on('connection_response', (data) => {
+                    this.sessionId = data.session_id;
+                    this.userId = data.user_id;
+                    this.isConnected = true;
+                    this.updateConnectionStatus(true);
+                    console.log('Connected:', data);
+                });
+
+                this.socket.on('document_loaded', (data) => {
+                    this.editor.value = data.content;
+                    this.currentVersion = data.version;
+                    this.localVersion = data.version;
+                    document.getElementById('versionBadge').textContent = `v${data.version}`;
+                    document.getElementById('docTitle').value = data.title;
+                    this.updateStats();
+                    this.showNotification(`Document loaded. ${data.users_online} user(s) online.`);
+                });
+
+                this.socket.on('content_update', (data) => {
+                    if (data.user === this.username) return; // Ignore own updates
+
+                    // Apply remote operation
+                    const content = this.editor.value;
+                    let newContent = content;
+
+                    if (data.operation.type === 'insert') {
+                        newContent = content.slice(0, data.operation.pos) + 
+                                    data.operation.text + 
+                                    content.slice(data.operation.pos);
+                    } else if (data.operation.type === 'delete') {
+                        newContent = content.slice(0, data.operation.pos) + 
+                                    content.slice(data.operation.pos + data.operation.length);
+                    }
+
+                    // Preserve cursor position
+                    const cursorPos = this.editor.selectionStart;
+                    this.editor.value = newContent;
+                    
+                    // Adjust cursor if affected by remote edit
+                    if (data.operation.type === 'insert' && data.operation.pos <= cursorPos) {
+                        this.editor.setSelectionRange(cursorPos + data.operation.text.length, cursorPos + data.operation.text.length);
+                    } else if (data.operation.type === 'delete' && data.operation.pos < cursorPos) {
+                        const newPos = Math.max(data.operation.pos, cursorPos - data.operation.length);
+                        this.editor.setSelectionRange(newPos, newPos);
+                    } else {
+                        this.editor.setSelectionRange(cursorPos, cursorPos);
+                    }
+
+                    this.currentVersion = data.version;
+                    document.getElementById('versionBadge').textContent = `v${data.version}`;
+                    this.lastUpdateTime = new Date();
+                    this.updateStats();
+                    this.updateLastUpdate();
+                    
+                    this.showNotification(`${data.user} made changes`, 'info', 2000);
+                });
+
+                this.socket.on('user_joined', (data) => {
+                    this.showNotification(`${data.user} joined (${data.user_count} total)`);
+                });
+
+                this.socket.on('user_left', (data) => {
+                    this.showNotification(`${data.user} left (${data.user_count} total)`);
+                });
+
+                this.socket.on('cursor_updated', (data) => {
+                    this.updateRemoteCursor(data.session_id, data.user, data.position);
+                });
+
+                this.socket.on('error', (data) => {
+                    this.showNotification(`Error: ${data.message}`, 'error');
+                });
+
+                this.socket.on('disconnect', () => {
+                    this.isConnected = false;
+                    this.updateConnectionStatus(false);
+                    this.showNotification('Connection lost. Attempting to reconnect...', 'warning');
+                });
+
+                this.socket.on('connect_error', (error) => {
+                    console.error('Connection error:', error);
+                    this.updateConnectionStatus(false);
+                });
+            }
+
+            setupEventListeners() {
+                // Editor input
+                this.editor.addEventListener('input', (e) => this.handleInput(e));
+                this.editor.addEventListener('selectionchange', () => this.broadcastCursorPosition());
+                this.editor.addEventListener('click', () => this.broadcastCursorPosition());
+                this.editor.addEventListener('keyup', () => this.broadcastCursorPosition());
+
+                // New document button
+                document.getElementById('newDocBtn').addEventListener('click', () => this.createNewDocument());
+
+                // Copy share link
+                document.getElementById('copyBtn').addEventListener('click', () => this.copyShareLink());
+
+                // Document title
+                document.getElementById('docTitle').addEventListener('change', (e) => {
+                    // In production, save title to backend
+                });
+            }
+
+            handleInput(event) {
+                if (!this.isConnected) {
+                    this.showNotification('Waiting for connection...', 'warning');
+                    return;
+                }
+
+                const currentContent = this.editor.value;
+                const cursorPos = this.editor.selectionStart;
+
+                // Calculate operation (simplified - detects insert/delete)
+                // In production, use a proper diff algorithm
+                let operation = null;
+
+                // For demonstration, we'll send operations on every change
+                // In production, you'd batch changes and use efficient diffing
+                
+                this.sendOperation({
+                    type: 'insert',
+                    pos: cursorPos - 1,
+                    text: currentContent[cursorPos - 1] || '',
+                    timestamp: new Date().toISOString()
+                });
+            }
+
+            sendOperation(operation) {
+                if (!this.documentId || !this.isConnected) return;
+
+                this.pendingOperations.push(operation);
+                this.updateSyncStatus('syncing');
+
+                this.socket.emit('edit', {
+                    doc_id: this.documentId,
+                    session_id: this.sessionId,
+                    operation: operation,
+                    version: this.localVersion
+                });
+            }
+
+            broadcastCursorPosition() {
+                if (!this.documentId || !this.isConnected) return;
+
+                const position = this.editor.selectionStart;
+                this.socket.emit('cursor_move', {
+                    doc_id: this.documentId,
+                    session_id: this.sessionId,
+                    position: position
+                });
+            }
+
+            updateRemoteCursor(sessionId, username, position) {
+                this.remoteCursors.set(sessionId, { username, position });
+                this.renderRemoteCursors();
+            }
+
+            renderRemoteCursors() {
+                const container = document.getElementById('remotesCursorsContainer');
+                container.innerHTML = '';
+
+                this.remoteCursors.forEach((cursor, sessionId) => {
+                    const indicator = document.createElement('div');
+                    indicator.className = 'remote-cursor';
+                    indicator.title = cursor.username;
+                    
+                    const charWidth = 8;
+                    const lineHeight = 20;
+                    const offsetLeft = (cursor.position % 50) * charWidth;
+                    const offsetTop = Math.floor(cursor.position / 50) * lineHeight;
+
+                    indicator.style.left = offsetLeft + 'px';
+                    indicator.style.top = offsetTop + 'px';
+                    
+                    const label = document.createElement('div');
+                    label.className = 'cursor-label';
+                    label.textContent = cursor.username;
+                    indicator.appendChild(label);
+
+                    container.appendChild(indicator);
+                });
+            }
+
+            updateStats() {
+                const content = this.editor.value;
+                document.getElementById('charCount').textContent = content.length;
+                document.getElementById('wordCount').textContent = content.trim().split(/\s+/).filter(w => w).length;
+                document.getElementById('lineCount').textContent = content.split('\n').length;
+            }
+
+            updateLastUpdate() {
+                const now = new Date();
+                const diff = now - this.lastUpdateTime;
+                
+                if (diff < 1000) {
+                    document.getElementById('lastUpdate').textContent = 'just now';
+                } else if (diff < 60000) {
+                    document.getElementById('lastUpdate').textContent = Math.floor(diff / 1000) + 's ago';
+                } else {
+                    document.getElementById('lastUpdate').textContent = Math.floor(diff / 60000) + 'm ago';
+                }
+            }
+
+            updateConnectionStatus(connected) {
+                const statusEl = document.getElementById('userStatus');
+                if (connected) {
+                    statusEl.className = 'user-status connected';
+                    statusEl.title = 'Connected';
+                } else {
+                    statusEl.className = 'user-status disconnected';
+                    statusEl.title = 'Disconnected';
+                }
+            }
+
+            updateSyncStatus(status) {
+                const indicator = document.getElementById('syncIndicator');
+                const statusText = document.getElementById('syncStatus');
+
+                if (status === 'syncing') {
+                    indicator.className = 'sync-indicator syncing';
+                    statusText.textContent = 'Syncing...';
+                } else if (status === 'synced') {
+                    indicator.className = 'sync-indicator synced';
+                    statusText.textContent = 'Synced';
+                }
+
+                // Auto-clear syncing status after 500ms
+                if (status === 'syncing') {
+                    setTimeout(() => this.updateSyncStatus('synced'), 500);
+                }
+            }
+
+            createNewDocument() {
+                fetch('/api/documents', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ title: 'New Document' })
+                })
+                .then(r => r.json())
+                .then(data => {
+                    window.location.href = `?doc=${data.doc_id}`;
+                });
+            }
+
+            joinDocument(docId) {
+                this.documentId = docId;
+
+                // Retrieve document
+                fetch(`/api/documents/${docId}`)
+                    .then(r => r.json())
+                    .then(data => {
+                        this.editor.value = data.content;
+                        this.currentVersion = data.version;
+                        this.localVersion = data.version;
+                        document.getElementById('versionBadge').textContent = `v${data.version}`;
+                        document.getElementById('docTitle').value = data.title;
+                        this.updateStats();
+                    });
+
+                // Join via WebSocket
+                this.socket.emit('join_document', {
+                    doc_id: docId,
+                    session_id: this.sessionId
+                });
+
+                this.updateShareLink();
+            }
+
+            checkForDocumentId() {
+                const params = new URLSearchParams(window.location.search);
+                let docId = params.get('doc');
+
+                if (!docId) {
+                    // Create new document
+                    fetch('/api/documents', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ title: 'Untitled Document' })
+                    })
+                    .then(r => r.json())
+                    .then(data => {
+                        window.history.replaceState({}, '', `?doc=${data.doc_id}`);
+                        this.joinDocument(data.doc_id);
+                    });
+                } else {
+                    this.joinDocument(docId);
+                }
+            }
+
+            updateShareLink() {
+                const link = `${window.location.origin}/?doc=${this.documentId}`;
+                document.getElementById('shareLink').value = link;
+            }
+
+            copyShareLink() {
+                const input = document.getElementById('shareLink');
+                input.select();
+                document.execCommand('copy');
+                this.showNotification('Link copied to clipboard!', 'success');
+            }
+
+            showNotification(message, type = 'info', duration = 3000) {
+                const container = document.getElementById('notificationContainer');
+                const notification = document.createElement('div');
+                notification.className = `notification notification-${type}`;
+                notification.textContent = message;
+                
+                container.appendChild(notification);
+
+                setTimeout(() => {
+                    notification.classList.add('fade-out');
+                    setTimeout(() => notification.remove(), 300);
+                }, duration);
+            }
+        }
+
+        // Initialize when DOM is ready
+        document.addEventListener('DOMContentLoaded', () => {
+            const client = new CollaborationClient();
+        });
+    </script>
+</body>
+</html>
